@@ -387,7 +387,7 @@ mod tests {
         super::*,
         crate::frame::{
             Codec,
-            tests::{Rng, pair},
+            tests::{Rng, cam, pair},
         },
     };
 
@@ -528,7 +528,7 @@ mod tests {
 
         for _ in 0..50 {
             let (frame, original) = h264_frame(&mut rng);
-            let sealed = encryptor.encrypt(Codec::H264, &frame).unwrap();
+            let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
 
             assert_eq!(
                 types(&sealed),
@@ -566,7 +566,7 @@ mod tests {
                 true,
             );
 
-            let opened = decryptor.decrypt(Codec::H264, &received).unwrap();
+            let opened = decryptor.decrypt(Codec::H264, &cam(), &received).unwrap();
             let expected = annex_b(
                 &[
                     &rewritten_sps,
@@ -588,7 +588,7 @@ mod tests {
         let mut rng = Rng::new(12);
         let (mut encryptor, decryptor) = pair(5);
         let (frame, _) = h264_frame(&mut rng);
-        let sealed = encryptor.encrypt(Codec::H264, &frame).unwrap();
+        let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
         let sealed_units = units(&sealed).unwrap();
 
         let without_first_slice = annex_b(
@@ -602,7 +602,7 @@ mod tests {
         );
         assert!(
             decryptor
-                .decrypt(Codec::H264, &without_first_slice)
+                .decrypt(Codec::H264, &cam(), &without_first_slice)
                 .is_err()
         );
 
@@ -614,7 +614,7 @@ mod tests {
             + 5;
         header_changed[at] ^= 0x01;
         assert_eq!(
-            decryptor.decrypt(Codec::H264, &header_changed),
+            decryptor.decrypt(Codec::H264, &cam(), &header_changed),
             Err(FrameError::Auth)
         );
     }
@@ -625,7 +625,7 @@ mod tests {
         let (_, decryptor) = pair(5);
         let (frame, _) = h264_frame(&mut rng);
         assert_eq!(
-            decryptor.decrypt(Codec::H264, &frame),
+            decryptor.decrypt(Codec::H264, &cam(), &frame),
             Err(FrameError::NoTrailer)
         );
     }
@@ -639,8 +639,14 @@ mod tests {
             &[0x68, 0xCE, 0x3C, 0x80],
         ];
         let frame = annex_b(&units, false);
-        assert_eq!(encryptor.encrypt(Codec::H264, &frame).unwrap(), frame);
-        assert_eq!(decryptor.decrypt(Codec::H264, &frame).unwrap(), frame);
+        assert_eq!(
+            encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap(),
+            frame
+        );
+        assert_eq!(
+            decryptor.decrypt(Codec::H264, &cam(), &frame).unwrap(),
+            frame
+        );
     }
 
     #[test]
@@ -658,20 +664,23 @@ mod tests {
 
         // The order the phase 0 capture showed this encoder writing keyframes in.
         let frame = annex_b(&[&idr, &sps, &pps], true);
-        let sealed = encryptor.encrypt(Codec::H264, &frame).unwrap();
+        let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
         assert_eq!(types(&sealed), [0x67, 0x68, 0x65]);
         assert_eq!(
-            decryptor.decrypt(Codec::H264, &sealed).unwrap(),
+            decryptor.decrypt(Codec::H264, &cam(), &sealed).unwrap(),
             annex_b(&[&sps, &pps, &idr], true)
         );
 
         let frame = annex_b(&[&aud, &idr, &sps, &pps], true);
-        let sealed = encryptor.encrypt(Codec::H264, &frame).unwrap();
+        let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
         assert_eq!(types(&sealed), [0x09, 0x67, 0x68, 0x65]);
 
         let already = annex_b(&[&sps, &pps, &idr], true);
-        let sealed = encryptor.encrypt(Codec::H264, &already).unwrap();
-        assert_eq!(decryptor.decrypt(Codec::H264, &sealed).unwrap(), already);
+        let sealed = encryptor.encrypt(Codec::H264, &cam(), &already).unwrap();
+        assert_eq!(
+            decryptor.decrypt(Codec::H264, &cam(), &sealed).unwrap(),
+            already
+        );
     }
 
     #[test]
@@ -694,10 +703,10 @@ mod tests {
             let refs: Vec<&[u8]> = nals.iter().map(Vec::as_slice).collect();
             let frame = annex_b(&refs, rng.below(2) == 0);
 
-            let sealed = encryptor.encrypt(Codec::H264, &frame).unwrap();
+            let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
             assert_eq!(types(&sealed), types(&frame));
             assert_eq!(
-                decryptor.decrypt(Codec::H264, &sealed).unwrap(),
+                decryptor.decrypt(Codec::H264, &cam(), &sealed).unwrap(),
                 annex_b(&refs, true)
             );
         }
@@ -732,11 +741,11 @@ mod tests {
         };
         assert_eq!(prefix, 3);
 
-        let sealed = encryptor.encrypt(Codec::H265, &frame).unwrap();
+        let sealed = encryptor.encrypt(Codec::H265, &cam(), &frame).unwrap();
         assert_eq!(types(&sealed), types(&annex_b(&nals, true)));
         assert_eq!(units(&sealed).unwrap()[..3], nals[..3]);
         assert_eq!(
-            decryptor.decrypt(Codec::H265, &sealed).unwrap(),
+            decryptor.decrypt(Codec::H265, &cam(), &sealed).unwrap(),
             annex_b(&nals, true)
         );
     }

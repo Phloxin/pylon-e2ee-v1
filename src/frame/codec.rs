@@ -83,16 +83,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::frame::{Codec, FrameError, tests::pair};
+    use crate::frame::{
+        Codec, FrameError,
+        tests::{cam, pair},
+    };
 
     #[test]
     fn opus_and_vp9_encrypt_everything() {
         for codec in [Codec::Opus, Codec::Vp9] {
             let (mut encryptor, decryptor) = pair(1);
             let frame = vec![0xAB; 120];
-            let sealed = encryptor.encrypt(codec, &frame).unwrap();
+            let sealed = encryptor.encrypt(codec, &cam(), &frame).unwrap();
             assert_ne!(sealed[0], 0xAB);
-            assert_eq!(decryptor.decrypt(codec, &sealed).unwrap(), frame);
+            assert_eq!(decryptor.decrypt(codec, &cam(), &sealed).unwrap(), frame);
         }
     }
 
@@ -105,25 +108,28 @@ mod tests {
             &[0x55; 50],
         ]
         .concat();
-        let sealed = encryptor.encrypt(Codec::Vp8, &key).unwrap();
+        let sealed = encryptor.encrypt(Codec::Vp8, &cam(), &key).unwrap();
         assert_eq!(sealed[..10], key[..10]);
         assert_ne!(sealed[10..60], key[10..]);
-        assert_eq!(decryptor.decrypt(Codec::Vp8, &sealed).unwrap(), key);
+        assert_eq!(decryptor.decrypt(Codec::Vp8, &cam(), &sealed).unwrap(), key);
 
         let delta = [&[0x31u8][..], &[0x55; 50]].concat();
-        let sealed = encryptor.encrypt(Codec::Vp8, &delta).unwrap();
+        let sealed = encryptor.encrypt(Codec::Vp8, &cam(), &delta).unwrap();
         assert_eq!(sealed[0], 0x31);
         assert_ne!(sealed[1], 0x55);
-        assert_eq!(decryptor.decrypt(Codec::Vp8, &sealed).unwrap(), delta);
+        assert_eq!(
+            decryptor.decrypt(Codec::Vp8, &cam(), &sealed).unwrap(),
+            delta
+        );
     }
 
     #[test]
     fn vp8_clear_bytes_are_authenticated() {
         let (mut encryptor, decryptor) = pair(1);
-        let mut sealed = encryptor.encrypt(Codec::Vp8, &[0x10; 40]).unwrap();
+        let mut sealed = encryptor.encrypt(Codec::Vp8, &cam(), &[0x10; 40]).unwrap();
         sealed[3] ^= 0x40;
         assert_eq!(
-            decryptor.decrypt(Codec::Vp8, &sealed),
+            decryptor.decrypt(Codec::Vp8, &cam(), &sealed),
             Err(FrameError::Auth)
         );
     }
@@ -133,8 +139,8 @@ mod tests {
         let (mut encryptor, decryptor) = pair(1);
         for codec in [Codec::Opus, Codec::Vp8, Codec::Vp9] {
             for frame in [&[][..], &[0x00][..], &[0x01, 0x02][..]] {
-                let sealed = encryptor.encrypt(codec, frame).unwrap();
-                assert_eq!(decryptor.decrypt(codec, &sealed).unwrap(), frame);
+                let sealed = encryptor.encrypt(codec, &cam(), frame).unwrap();
+                assert_eq!(decryptor.decrypt(codec, &cam(), &sealed).unwrap(), frame);
             }
         }
     }

@@ -7,18 +7,51 @@ edition = "2024"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-wasm = ["dep:wasm-bindgen"]
+default = ["frame"]
+# Frame encryption and the key schedule: clients and the native encoder.
+frame = ["dep:aes", "dep:ctr", "dep:ghash", "dep:subtle"]
+# An MLS group member: the client's E2EE worker.
+client = ["frame", "mls"]
+# The node's delivery service and external sender. The only feature the server builds.
+ds = ["mls"]
+# Shared by `client` and `ds`; not meant to be enabled on its own.
+mls = [
+    "dep:openmls",
+    "dep:openmls_basic_credential",
+    "dep:openmls_rust_crypto",
+    "dep:openmls_traits",
+    "dep:tls_codec",
+]
+# Bindings for the client's worker.
+wasm = ["client", "dep:wasm-bindgen", "dep:js-sys", "dep:getrandom_02", "openmls/js"]
 
 [dependencies]
-aes = "0.8"
-ctr = "0.9"
-ghash = "0.5"
 hkdf = "0.12"
 sha2 = "0.10"
-subtle = "2.6"
+
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+ghash = { version = "0.5", optional = true }
+subtle = { version = "2.6", optional = true }
+
+openmls = { version = "0.9.1", optional = true }
+openmls_basic_credential = { version = "0.6", optional = true }
+openmls_rust_crypto = { version = "0.6", optional = true }
+openmls_traits = { version = "0.6", optional = true }
+tls_codec = { version = "0.5", optional = true }
 
 # Pinned to the wasm-bindgen-cli in flake.nix; the two must match exactly.
 wasm-bindgen = { version = "=0.2.121", optional = true }
+js-sys = { version = "0.3.98", optional = true }
+
+# openmls_rust_crypto's RNG goes through getrandom 0.2, which only builds for the browser with
+# `js`. (openmls's own `js` feature covers its newer getrandom.)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
 
 [dev-dependencies]
 aes-gcm = "0.10"
+
+[[example]]
+name = "capture"
+required-features = ["frame"]

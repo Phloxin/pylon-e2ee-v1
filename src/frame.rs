@@ -1,6 +1,7 @@
 mod codec;
 mod gcm;
 mod leb128;
+mod source;
 mod trailer;
 
 use {
@@ -9,7 +10,7 @@ use {
     trailer::Trailer,
 };
 
-const VERSION: u8 = 1;
+pub use {crate::format::Format, source::Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -95,12 +96,33 @@ fn nonce(kid: u8, counter: u32) -> [u8; NONCE_LEN] {
     nonce
 }
 
-fn aad(codec: Codec, kid: u8, epoch: u8, counter: u32, codec_aad: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(8 + codec_aad.len());
-    aad.extend_from_slice(&[VERSION, codec as u8, kid, epoch]);
-    aad.extend_from_slice(&counter.to_be_bytes());
-    aad.extend_from_slice(codec_aad);
-    aad
+struct Header<'a> {
+    format: Format,
+    codec: Codec,
+    kid: u8,
+    epoch: u8,
+    counter: u32,
+    source: &'a Source,
+}
+
+impl Header<'_> {
+    /// `format || codec || kid || epoch || counter_be32 || source || codec AAD` (plan 3.4).
+    fn aad(&self, codec_aad: &[u8]) -> Vec<u8> {
+        let source = self.source.as_bytes();
+        let mut aad = Vec::with_capacity(8 + source.len() + codec_aad.len());
+        aad.extend_from_slice(&[self.format as u8, self.codec as u8, self.kid, self.epoch]);
+        aad.extend_from_slice(&self.counter.to_be_bytes());
+        aad.extend_from_slice(source);
+        aad.extend_from_slice(codec_aad);
+        aad
+    }
+}
+
+/// One epoch's key, and the format of the group it came from.
+struct EpochKey {
+    format: Format,
+    epoch: u8,
+    gcm: Gcm,
 }
 
 /// Encrypts every frame one sender process sends. All of the process's sources share it, so
@@ -108,12 +130,12 @@ fn aad(codec: Codec, kid: u8, epoch: u8, counter: u32, codec_aad: &[u8]) -> Vec<
 pub struct Encryptor {
     kid: u8,
     counter: u32,
-    key: Option<(u8, Gcm)>,
+    key: Option<EpochKey>,
 }
 
 impl Encryptor {
     /// `counter` is where this process starts counting. The counter never goes back, not even
-    /// across key changes, because the same key can come back (phase 0 has one per root).
+    /// across key changes, so a key that comes back can't reuse a nonce.
     pub fn new(kid: u8, counter: u32) -> Self {
         Self {
             kid,
@@ -122,29 +144,54 @@ impl Encryptor {
         }
     }
 
-    pub fn set_key(&mut self, epoch: u8, key: &[u8; KEY_LEN]) {
-        self.key = Some((epoch, Gcm::new(key)));
+    pub fn set_key(&mut self, format: Format, epoch: u8, key: &[u8; KEY_LEN]) {
+        self.key = Some(EpochKey {
+            format,
+            epoch,
+            gcm: Gcm::new(key),
+        });
     }
 
     pub fn clear_key(&mut self) {
         self.key = None;
     }
 
-    pub fn encrypt(&mut self, codec: Codec, frame: &[u8]) -> Result<Vec<u8>, FrameError> {
-        let (epoch, gcm) = self.key.as_ref().ok_or(FrameError::NoKey)?;
-        let epoch = *epoch;
-        let kid = self.kid;
-        let counter = self.counter;
-        self.counter = counter.checked_add(1).ok_or(FrameError::CounterExhausted)?;
+    /// The epoch frames are being sent under, if there's a key.
+    pub fn epoch(&self) -> Option<u8> {
+        self.key.as_ref().map(|key| key.epoch)
+    }
+
+    pub fn encrypt(
+        &mut self,
+        codec: Codec,
+        source: &Source,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, FrameError> {
+        let key = self.key.as_ref().ok_or(FrameError::NoKey)?;
+        let header = Header {
+            format: key.format,
+            codec,
+            kid: self.kid,
+            epoch: key.epoch,
+            counter: self.counter,
+            source,
+        };
+        self.counter = header
+            .counter
+            .checked_add(1)
+            .ok_or(FrameError::CounterExhausted)?;
 
         codec::seal(codec, frame, |codec_aad, plain| {
-            let aad = aad(codec, kid, epoch, counter, codec_aad);
-            let tag = gcm.seal(&nonce(kid, counter), &aad, plain);
+            let tag = key.gcm.seal(
+                &nonce(header.kid, header.counter),
+                &header.aad(codec_aad),
+                plain,
+            );
             Trailer {
                 tag,
-                counter,
-                kid,
-                epoch,
+                counter: header.counter,
+                kid: header.kid,
+                epoch: header.epoch,
             }
             .to_vec()
         })
@@ -159,10 +206,11 @@ pub struct FrameInfo {
     pub counter: u32,
 }
 
-/// Decrypts the frames of one sender.
+/// Decrypts the frames of one sender. It holds a key per epoch; the trailer's epoch byte picks
+/// one, so frames from just before a key change still decrypt.
 #[derive(Default)]
 pub struct Decryptor {
-    keys: Vec<(u8, Gcm)>,
+    keys: Vec<EpochKey>,
 }
 
 impl Decryptor {
@@ -170,49 +218,66 @@ impl Decryptor {
         Self::default()
     }
 
-    pub fn set_key(&mut self, epoch: u8, key: &[u8; KEY_LEN]) {
+    pub fn set_key(&mut self, format: Format, epoch: u8, key: &[u8; KEY_LEN]) {
         self.remove_key(epoch);
-        self.keys.push((epoch, Gcm::new(key)));
+        self.keys.push(EpochKey {
+            format,
+            epoch,
+            gcm: Gcm::new(key),
+        });
     }
 
     pub fn remove_key(&mut self, epoch: u8) {
-        self.keys.retain(|(e, _)| *e != epoch);
+        self.keys.retain(|key| key.epoch != epoch);
     }
 
-    pub fn decrypt(&self, codec: Codec, frame: &[u8]) -> Result<Vec<u8>, FrameError> {
-        self.decrypt_with_info(codec, frame).map(|(plain, _)| plain)
+    pub fn has_key(&self, epoch: u8) -> bool {
+        self.keys.iter().any(|key| key.epoch == epoch)
     }
 
-    /// The info is `None` for a frame with nothing to protect (H26X parameter sets, an AV1
-    /// sequence header), which goes through as-is.
+    pub fn decrypt(
+        &self,
+        codec: Codec,
+        source: &Source,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, FrameError> {
+        self.decrypt_with_info(codec, source, frame)
+            .map(|(plain, _)| plain)
+    }
+
+    /// The info is `None` for an H26X frame made only of parameter sets and delimiters, which
+    /// goes through as-is (plan 3.2).
     pub fn decrypt_with_info(
         &self,
         codec: Codec,
+        source: &Source,
         frame: &[u8],
     ) -> Result<(Vec<u8>, Option<FrameInfo>), FrameError> {
         let mut info = None;
         let plain = codec::open(codec, frame, |codec_aad, cipher, trailer| {
-            let (_, gcm) = self
+            let key = self
                 .keys
                 .iter()
-                .find(|(epoch, _)| *epoch == trailer.epoch)
+                .find(|key| key.epoch == trailer.epoch)
                 .ok_or(FrameError::NoKey)?;
 
-            let aad = aad(
+            let header = Header {
+                format: key.format,
                 codec,
-                trailer.kid,
-                trailer.epoch,
-                trailer.counter,
-                codec_aad,
-            );
-            gcm.open(
-                &nonce(trailer.kid, trailer.counter),
-                &aad,
-                cipher,
-                &trailer.tag,
-            )
-            .then_some(())
-            .ok_or(FrameError::Auth)?;
+                kid: trailer.kid,
+                epoch: trailer.epoch,
+                counter: trailer.counter,
+                source,
+            };
+            key.gcm
+                .open(
+                    &nonce(trailer.kid, trailer.counter),
+                    &header.aad(codec_aad),
+                    cipher,
+                    &trailer.tag,
+                )
+                .then_some(())
+                .ok_or(FrameError::Auth)?;
 
             info = Some(FrameInfo {
                 kid: trailer.kid,
@@ -259,12 +324,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn pair(sender: u64) -> (Encryptor, Decryptor) {
-        let key = crate::key::static_sender_key(b"test root", sender);
+        let key = crate::key::sender_key(b"test root", sender);
         let mut encryptor = Encryptor::new(0, 0);
-        encryptor.set_key(0, &key);
+        encryptor.set_key(Format::V1, 0, &key);
         let mut decryptor = Decryptor::new();
-        decryptor.set_key(0, &key);
+        decryptor.set_key(Format::V1, 0, &key);
         (encryptor, decryptor)
+    }
+
+    pub(crate) fn cam() -> Source {
+        Source::webcam()
     }
 
     #[test]
@@ -289,15 +358,19 @@ pub(crate) mod tests {
     #[test]
     fn counter_advances_and_never_reuses_a_nonce() {
         let (mut encryptor, decryptor) = pair(1);
-        let a = encryptor.encrypt(Codec::Opus, b"same").unwrap();
-        let b = encryptor.encrypt(Codec::Opus, b"same").unwrap();
+        let a = encryptor.encrypt(Codec::Opus, &cam(), b"same").unwrap();
+        let b = encryptor.encrypt(Codec::Opus, &cam(), b"same").unwrap();
         assert_ne!(a, b);
-        let (plain, info) = decryptor.decrypt_with_info(Codec::Opus, &a).unwrap();
+        let (plain, info) = decryptor
+            .decrypt_with_info(Codec::Opus, &cam(), &a)
+            .unwrap();
         assert_eq!(
             (plain.as_slice(), info.map(|i| i.counter)),
             (&b"same"[..], Some(0))
         );
-        let (plain, info) = decryptor.decrypt_with_info(Codec::Opus, &b).unwrap();
+        let (plain, info) = decryptor
+            .decrypt_with_info(Codec::Opus, &cam(), &b)
+            .unwrap();
         assert_eq!(
             (plain.as_slice(), info.map(|i| i.counter)),
             (&b"same"[..], Some(1))
@@ -307,9 +380,9 @@ pub(crate) mod tests {
     #[test]
     fn counter_exhaustion_stops_encryption() {
         let mut encryptor = Encryptor::new(0, u32::MAX);
-        encryptor.set_key(0, &[1; 16]);
+        encryptor.set_key(Format::V1, 0, &[1; 16]);
         assert_eq!(
-            encryptor.encrypt(Codec::Opus, b"x"),
+            encryptor.encrypt(Codec::Opus, &cam(), b"x"),
             Err(FrameError::CounterExhausted)
         );
     }
@@ -317,12 +390,15 @@ pub(crate) mod tests {
     #[test]
     fn no_key() {
         let mut encryptor = Encryptor::new(0, 0);
-        assert_eq!(encryptor.encrypt(Codec::Opus, b"x"), Err(FrameError::NoKey));
+        assert_eq!(
+            encryptor.encrypt(Codec::Opus, &cam(), b"x"),
+            Err(FrameError::NoKey)
+        );
 
         let (mut encryptor, _) = pair(1);
-        let sealed = encryptor.encrypt(Codec::Opus, b"x").unwrap();
+        let sealed = encryptor.encrypt(Codec::Opus, &cam(), b"x").unwrap();
         assert_eq!(
-            Decryptor::new().decrypt(Codec::Opus, &sealed),
+            Decryptor::new().decrypt(Codec::Opus, &cam(), &sealed),
             Err(FrameError::NoKey)
         );
     }
@@ -332,14 +408,67 @@ pub(crate) mod tests {
         let (mut encryptor, _) = pair(1);
         let (_, other) = pair(2);
         let (_, right) = pair(1);
-        let sealed = encryptor.encrypt(Codec::Vp9, &[5; 64]).unwrap();
+        let sealed = encryptor.encrypt(Codec::Vp9, &cam(), &[5; 64]).unwrap();
 
-        assert_eq!(other.decrypt(Codec::Vp9, &sealed), Err(FrameError::Auth));
-        assert_eq!(right.decrypt(Codec::Opus, &sealed), Err(FrameError::Auth));
+        assert_eq!(
+            other.decrypt(Codec::Vp9, &cam(), &sealed),
+            Err(FrameError::Auth)
+        );
+        assert_eq!(
+            right.decrypt(Codec::Opus, &cam(), &sealed),
+            Err(FrameError::Auth)
+        );
 
         let mut moved = Decryptor::new();
-        moved.set_key(1, &crate::key::static_sender_key(b"test root", 1));
-        assert_eq!(moved.decrypt(Codec::Vp9, &sealed), Err(FrameError::NoKey));
+        moved.set_key(Format::V1, 1, &crate::key::sender_key(b"test root", 1));
+        assert_eq!(
+            moved.decrypt(Codec::Vp9, &cam(), &sealed),
+            Err(FrameError::NoKey)
+        );
+    }
+
+    #[test]
+    fn frames_are_bound_to_their_source() {
+        let (mut encryptor, decryptor) = pair(1);
+        let mic = encryptor
+            .encrypt(Codec::Opus, &Source::mic(), &[7; 80])
+            .unwrap();
+        assert_eq!(
+            decryptor.decrypt(Codec::Opus, &Source::stream_audio("1:2:k").unwrap(), &mic),
+            Err(FrameError::Auth)
+        );
+        assert!(decryptor.decrypt(Codec::Opus, &Source::mic(), &mic).is_ok());
+
+        let stream = Source::stream("1:2:k").unwrap();
+        let screen = encryptor.encrypt(Codec::Vp9, &stream, &[7; 80]).unwrap();
+        for wrong in [Source::webcam(), Source::stream("1:2:other").unwrap()] {
+            assert_eq!(
+                decryptor.decrypt(Codec::Vp9, &wrong, &screen),
+                Err(FrameError::Auth)
+            );
+        }
+        assert!(decryptor.decrypt(Codec::Vp9, &stream, &screen).is_ok());
+    }
+
+    #[test]
+    fn format_leads_the_aad() {
+        assert_eq!(Format::from_id(1), Some(Format::V1));
+        assert_eq!(Format::from_id(0), None);
+        assert_eq!(Format::from_id(2), None);
+
+        let source = Source::stream("1:2:k").unwrap();
+        let header = Header {
+            format: Format::V1,
+            codec: Codec::Vp8,
+            kid: 1,
+            epoch: 9,
+            counter: 0x0102_0304,
+            source: &source,
+        };
+        assert_eq!(
+            header.aad(&[0xAA]),
+            [&[1, 2, 1, 9, 1, 2, 3, 4][..], b"\x03\x051:2:k", &[0xAA]].concat()
+        );
     }
 
     #[test]
@@ -347,7 +476,7 @@ pub(crate) mod tests {
         let (_, decryptor) = pair(1);
         for codec in [Codec::Opus, Codec::Vp8, Codec::Vp9] {
             assert_eq!(
-                decryptor.decrypt(codec, &[0x10; 40]),
+                decryptor.decrypt(codec, &cam(), &[0x10; 40]),
                 Err(FrameError::NoTrailer)
             );
         }
@@ -376,7 +505,7 @@ pub(crate) mod tests {
                 if rng.below(2) == 0 {
                     frame.extend_from_slice(&[12, 0xFA, 0xFA]);
                 }
-                let _ = decryptor.decrypt(codec, &frame);
+                let _ = decryptor.decrypt(codec, &cam(), &frame);
             }
         }
     }
