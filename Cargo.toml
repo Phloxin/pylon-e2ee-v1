@@ -1,0 +1,24 @@
+[package]
+name = "pylon-e2ee"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+aes = "0.8"
+ctr = "0.9"
+ghash = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+
+# Pinned to the wasm-bindgen-cli in flake.nix; the two must match exactly.
+wasm-bindgen = { version = "=0.2.121", optional = true }
+
+[dev-dependencies]
+aes-gcm = "0.10"
