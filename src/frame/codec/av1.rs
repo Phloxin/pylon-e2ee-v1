@@ -165,7 +165,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use {
         super::*,
         crate::frame::{
@@ -174,7 +174,12 @@ mod tests {
         },
     };
 
-    fn obu(kind: u8, extension: Option<u8>, payload: &[u8], size_width: Option<usize>) -> Vec<u8> {
+    pub(crate) fn obu(
+        kind: u8,
+        extension: Option<u8>,
+        payload: &[u8],
+        size_width: Option<usize>,
+    ) -> Vec<u8> {
         let mut header = kind << 3;
         if extension.is_some() {
             header |= HAS_EXTENSION;
@@ -200,7 +205,7 @@ mod tests {
     #[test]
     fn round_trip_through_chromium_size_rewrites() {
         let mut rng = Rng::new(31);
-        let (mut encryptor, decryptor) = pair(3);
+        let (mut encryptor, mut decryptor) = pair(3);
 
         let sequence = rng.bytes(12);
         let frame_header = rng.bytes(20);
@@ -244,7 +249,7 @@ mod tests {
 
     #[test]
     fn headers_are_authenticated() {
-        let (mut encryptor, decryptor) = pair(3);
+        let (mut encryptor, mut decryptor) = pair(3);
         let frame = [
             obu(3, Some(0x08), &[1; 20], Some(1)),
             obu(4, Some(0x08), &[2; 60], Some(1)),
@@ -262,7 +267,7 @@ mod tests {
 
     #[test]
     fn sequence_header_only_frames_are_protected() {
-        let (mut encryptor, decryptor) = pair(3);
+        let (mut encryptor, mut decryptor) = pair(3);
         let frame = obu(SEQUENCE_HEADER, None, &[1; 10], Some(1));
         let sealed = encryptor.encrypt(Codec::Av1, &cam(), &frame).unwrap();
         assert_ne!(sealed, frame);
@@ -280,7 +285,7 @@ mod tests {
 
     #[test]
     fn unauthenticated_obus_never_reach_the_decoder() {
-        let (mut encryptor, decryptor) = pair(3);
+        let (mut encryptor, mut decryptor) = pair(3);
         let tiles = obu(6, None, &[4; 40], Some(1));
         let sealed = encryptor.encrypt(Codec::Av1, &cam(), &tiles).unwrap();
 
@@ -302,7 +307,7 @@ mod tests {
 
     #[test]
     fn plaintext_tiles_are_rejected() {
-        let (_, decryptor) = pair(3);
+        let (_, mut decryptor) = pair(3);
         let frame = [
             obu(3, None, &[1; 20], Some(1)),
             obu(4, None, &[2; 60], Some(1)),

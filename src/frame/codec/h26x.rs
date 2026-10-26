@@ -382,7 +382,7 @@ fn unescape(src: &[u8], mut zeros: usize) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use {
         super::*,
         crate::frame::{
@@ -391,20 +391,20 @@ mod tests {
         },
     };
 
-    struct BitWriter {
+    pub(crate) struct BitWriter {
         bytes: Vec<u8>,
         used: u8,
     }
 
     impl BitWriter {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 bytes: Vec::new(),
                 used: 8,
             }
         }
 
-        fn bit(&mut self, bit: u32) -> &mut Self {
+        pub(crate) fn bit(&mut self, bit: u32) -> &mut Self {
             if self.used == 8 {
                 self.bytes.push(0);
                 self.used = 0;
@@ -416,7 +416,7 @@ mod tests {
             self
         }
 
-        fn ue(&mut self, value: u32) -> &mut Self {
+        pub(crate) fn ue(&mut self, value: u32) -> &mut Self {
             let code = u64::from(value) + 1;
             let len = 64 - code.leading_zeros();
             for _ in 1..len {
@@ -429,7 +429,7 @@ mod tests {
         }
 
         /// The RBSP so far plus `payload`, escaped into an EBSP behind `header`.
-        fn nal(&mut self, header: &[u8], payload: &[u8]) -> Vec<u8> {
+        pub(crate) fn nal(&mut self, header: &[u8], payload: &[u8]) -> Vec<u8> {
             let mut rbsp = std::mem::take(&mut self.bytes);
             rbsp.extend_from_slice(payload);
             rbsp.push(0x80);
@@ -439,7 +439,7 @@ mod tests {
         }
     }
 
-    fn annex_b(units: &[&[u8]], long: bool) -> Vec<u8> {
+    pub(crate) fn annex_b(units: &[&[u8]], long: bool) -> Vec<u8> {
         let mut frame = Vec::new();
         for (i, nal) in units.iter().enumerate() {
             frame.extend_from_slice(if long || i == 0 {
@@ -453,7 +453,7 @@ mod tests {
     }
 
     /// Payload heavy on zeros so it is full of emulation prevention bytes.
-    fn zero_heavy(rng: &mut Rng, len: usize) -> Vec<u8> {
+    pub(crate) fn zero_heavy(rng: &mut Rng, len: usize) -> Vec<u8> {
         (0..len)
             .map(|_| match rng.below(4) {
                 0 | 1 => 0,
@@ -463,7 +463,7 @@ mod tests {
             .collect()
     }
 
-    fn h264_frame(rng: &mut Rng) -> (Vec<u8>, Vec<Vec<u8>>) {
+    pub(crate) fn h264_frame(rng: &mut Rng) -> (Vec<u8>, Vec<Vec<u8>>) {
         let sps = vec![0x67, 0x42, 0xC0, 0x1F, 0x8C, 0x8D, 0x40, 0x50];
         let pps = vec![0x68, 0xCE, 0x3C, 0x80];
         let aud = vec![0x09, 0xF0];
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn h264_round_trip_survives_chromium_receive_changes() {
         let mut rng = Rng::new(11);
-        let (mut encryptor, decryptor) = pair(5);
+        let (mut encryptor, mut decryptor) = pair(5);
 
         for _ in 0..50 {
             let (frame, original) = h264_frame(&mut rng);
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn h264_protected_structure_is_authenticated() {
         let mut rng = Rng::new(12);
-        let (mut encryptor, decryptor) = pair(5);
+        let (mut encryptor, mut decryptor) = pair(5);
         let (frame, _) = h264_frame(&mut rng);
         let sealed = encryptor.encrypt(Codec::H264, &cam(), &frame).unwrap();
         let sealed_units = units(&sealed).unwrap();
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn h264_plaintext_is_rejected() {
         let mut rng = Rng::new(13);
-        let (_, decryptor) = pair(5);
+        let (_, mut decryptor) = pair(5);
         let (frame, _) = h264_frame(&mut rng);
         assert_eq!(
             decryptor.decrypt(Codec::H264, &cam(), &frame),
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn parameter_set_only_frames_pass_through() {
-        let (mut encryptor, decryptor) = pair(5);
+        let (mut encryptor, mut decryptor) = pair(5);
         let units: [&[u8]; 3] = [
             &[0x09, 0xF0],
             &[0x67, 0x42, 0xC0, 0x1F],
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn parameter_sets_move_ahead_of_the_idr() {
         let mut rng = Rng::new(15);
-        let (mut encryptor, decryptor) = pair(5);
+        let (mut encryptor, mut decryptor) = pair(5);
         let aud = [0x09, 0xF0];
         let sps = [0x67, 0x42, 0xC0, 0x28, 0x88];
         let pps = [0x68, 0xCE, 0x3C, 0x80];
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn h264_random_payloads_keep_boundaries() {
         let mut rng = Rng::new(14);
-        let (mut encryptor, decryptor) = pair(5);
+        let (mut encryptor, mut decryptor) = pair(5);
         for _ in 0..300 {
             let slices = 1 + rng.below(4);
             let mut nals: Vec<Vec<u8>> = vec![vec![0x67, 0x42, 0xC0, 0x1F]];
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn h265_round_trip() {
         let mut rng = Rng::new(21);
-        let (mut encryptor, decryptor) = pair(9);
+        let (mut encryptor, mut decryptor) = pair(9);
 
         let vps = [0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
         let sps = vec![0x42, 0x01, 0x01, 0x01, 0x60, 0x90];

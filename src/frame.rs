@@ -67,6 +67,8 @@ pub enum FrameError {
     Auth,
     /// The counter is used up. The key must change before this sender can send again.
     CounterExhausted,
+    /// A counter already seen, or older than the window.
+    Replay,
 }
 
 impl FrameError {
@@ -77,6 +79,7 @@ impl FrameError {
             Self::NoTrailer => "no-trailer",
             Self::Auth => "auth",
             Self::CounterExhausted => "counter-exhausted",
+            Self::Replay => "replay",
         }
     }
 }
@@ -123,6 +126,86 @@ struct EpochKey {
     format: Format,
     epoch: u8,
     gcm: Gcm,
+    windows: Vec<(u8, ReplayWindow)>,
+}
+
+impl EpochKey {
+    fn new(format: Format, epoch: u8, key: &[u8; KEY_LEN]) -> Self {
+        Self {
+            format,
+            epoch,
+            gcm: Gcm::new(key),
+            windows: Vec::new(),
+        }
+    }
+
+    fn replay_window(&mut self, kid: u8, window: u32) -> &mut ReplayWindow {
+        let at = match self.windows.iter().position(|(k, _)| *k == kid) {
+            Some(at) => at,
+            None => {
+                self.windows.push((kid, ReplayWindow::new(window)));
+                self.windows.len() - 1
+            }
+        };
+        &mut self.windows[at].1
+    }
+}
+
+/// The counters seen within `window` of the highest one, as a ring of bits indexed by counter.
+struct ReplayWindow {
+    window: u32,
+    max: u32,
+    seen: Vec<u64>,
+    empty: bool,
+}
+
+impl ReplayWindow {
+    fn new(window: u32) -> Self {
+        Self {
+            window,
+            max: 0,
+            seen: vec![0; window.div_ceil(64) as usize],
+            empty: true,
+        }
+    }
+
+    fn bit(&self, counter: u32) -> (usize, u64) {
+        let index = counter as usize % (self.seen.len() * 64);
+        (index / 64, 1 << (index % 64))
+    }
+
+    fn mark(&mut self, counter: u32) {
+        let (word, bit) = self.bit(counter);
+        self.seen[word] |= bit;
+    }
+
+    fn check(&mut self, counter: u32) -> Result<(), FrameError> {
+        if self.empty {
+            self.empty = false;
+        } else if counter > self.max {
+            let shift = counter - self.max;
+            if shift as usize >= self.seen.len() * 64 {
+                self.seen.fill(0);
+            } else {
+                for exposed in self.max + 1..=counter {
+                    let (word, bit) = self.bit(exposed);
+                    self.seen[word] &= !bit;
+                }
+            }
+        } else if self.max - counter >= self.window {
+            return Err(FrameError::Replay);
+        } else {
+            let (word, bit) = self.bit(counter);
+            if self.seen[word] & bit != 0 {
+                return Err(FrameError::Replay);
+            }
+            self.seen[word] |= bit;
+            return Ok(());
+        }
+        self.max = counter;
+        self.mark(counter);
+        Ok(())
+    }
 }
 
 /// Encrypts every frame one sender process sends. All of the process's sources share it, so
@@ -145,11 +228,7 @@ impl Encryptor {
     }
 
     pub fn set_key(&mut self, format: Format, epoch: u8, key: &[u8; KEY_LEN]) {
-        self.key = Some(EpochKey {
-            format,
-            epoch,
-            gcm: Gcm::new(key),
-        });
+        self.key = Some(EpochKey::new(format, epoch, key));
     }
 
     pub fn clear_key(&mut self) {
@@ -208,23 +287,23 @@ pub struct FrameInfo {
 
 /// Decrypts the frames of one sender. It holds a key per epoch; the trailer's epoch byte picks
 /// one, so frames from just before a key change still decrypt.
-#[derive(Default)]
 pub struct Decryptor {
     keys: Vec<EpochKey>,
+    window: u32,
 }
 
 impl Decryptor {
-    pub fn new() -> Self {
-        Self::default()
+    /// `window` is how far behind the newest counter of an (epoch, kid) a frame may arrive.
+    pub fn new(window: u32) -> Self {
+        Self {
+            keys: Vec::new(),
+            window: window.max(1),
+        }
     }
 
     pub fn set_key(&mut self, format: Format, epoch: u8, key: &[u8; KEY_LEN]) {
         self.remove_key(epoch);
-        self.keys.push(EpochKey {
-            format,
-            epoch,
-            gcm: Gcm::new(key),
-        });
+        self.keys.push(EpochKey::new(format, epoch, key));
     }
 
     pub fn remove_key(&mut self, epoch: u8) {
@@ -236,7 +315,7 @@ impl Decryptor {
     }
 
     pub fn decrypt(
-        &self,
+        &mut self,
         codec: Codec,
         source: &Source,
         frame: &[u8],
@@ -248,16 +327,17 @@ impl Decryptor {
     /// The info is `None` for an H26X frame made only of parameter sets and delimiters, which
     /// goes through as-is (plan 3.2).
     pub fn decrypt_with_info(
-        &self,
+        &mut self,
         codec: Codec,
         source: &Source,
         frame: &[u8],
     ) -> Result<(Vec<u8>, Option<FrameInfo>), FrameError> {
+        let window = self.window;
         let mut info = None;
         let plain = codec::open(codec, frame, |codec_aad, cipher, trailer| {
             let key = self
                 .keys
-                .iter()
+                .iter_mut()
                 .find(|key| key.epoch == trailer.epoch)
                 .ok_or(FrameError::NoKey)?;
 
@@ -278,6 +358,9 @@ impl Decryptor {
                 )
                 .then_some(())
                 .ok_or(FrameError::Auth)?;
+            // After `open`, so a forged frame can't move the window.
+            key.replay_window(trailer.kid, window)
+                .check(trailer.counter)?;
 
             info = Some(FrameInfo {
                 kid: trailer.kid,
@@ -327,7 +410,7 @@ pub(crate) mod tests {
         let key = crate::key::sender_key(b"test root", sender);
         let mut encryptor = Encryptor::new(0, 0);
         encryptor.set_key(Format::V1, 0, &key);
-        let mut decryptor = Decryptor::new();
+        let mut decryptor = Decryptor::new(1024);
         decryptor.set_key(Format::V1, 0, &key);
         (encryptor, decryptor)
     }
@@ -357,7 +440,7 @@ pub(crate) mod tests {
 
     #[test]
     fn counter_advances_and_never_reuses_a_nonce() {
-        let (mut encryptor, decryptor) = pair(1);
+        let (mut encryptor, mut decryptor) = pair(1);
         let a = encryptor.encrypt(Codec::Opus, &cam(), b"same").unwrap();
         let b = encryptor.encrypt(Codec::Opus, &cam(), b"same").unwrap();
         assert_ne!(a, b);
@@ -398,7 +481,7 @@ pub(crate) mod tests {
         let (mut encryptor, _) = pair(1);
         let sealed = encryptor.encrypt(Codec::Opus, &cam(), b"x").unwrap();
         assert_eq!(
-            Decryptor::new().decrypt(Codec::Opus, &cam(), &sealed),
+            Decryptor::new(1024).decrypt(Codec::Opus, &cam(), &sealed),
             Err(FrameError::NoKey)
         );
     }
@@ -406,8 +489,8 @@ pub(crate) mod tests {
     #[test]
     fn wrong_sender_key_codec_or_epoch_fails() {
         let (mut encryptor, _) = pair(1);
-        let (_, other) = pair(2);
-        let (_, right) = pair(1);
+        let (_, mut other) = pair(2);
+        let (_, mut right) = pair(1);
         let sealed = encryptor.encrypt(Codec::Vp9, &cam(), &[5; 64]).unwrap();
 
         assert_eq!(
@@ -419,7 +502,7 @@ pub(crate) mod tests {
             Err(FrameError::Auth)
         );
 
-        let mut moved = Decryptor::new();
+        let mut moved = Decryptor::new(1024);
         moved.set_key(Format::V1, 1, &crate::key::sender_key(b"test root", 1));
         assert_eq!(
             moved.decrypt(Codec::Vp9, &cam(), &sealed),
@@ -429,7 +512,7 @@ pub(crate) mod tests {
 
     #[test]
     fn frames_are_bound_to_their_source() {
-        let (mut encryptor, decryptor) = pair(1);
+        let (mut encryptor, mut decryptor) = pair(1);
         let mic = encryptor
             .encrypt(Codec::Opus, &Source::mic(), &[7; 80])
             .unwrap();
@@ -473,7 +556,7 @@ pub(crate) mod tests {
 
     #[test]
     fn plaintext_frames_are_rejected() {
-        let (_, decryptor) = pair(1);
+        let (_, mut decryptor) = pair(1);
         for codec in [Codec::Opus, Codec::Vp8, Codec::Vp9] {
             assert_eq!(
                 decryptor.decrypt(codec, &cam(), &[0x10; 40]),
@@ -482,9 +565,212 @@ pub(crate) mod tests {
         }
     }
 
+    fn sealed_frames(encryptor: &mut Encryptor, count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| {
+                encryptor
+                    .encrypt(Codec::Opus, &cam(), &i.to_be_bytes())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replay_rejects_duplicates() {
+        let (mut encryptor, mut decryptor) = pair(1);
+        let sealed = encryptor.encrypt(Codec::Opus, &cam(), b"once").unwrap();
+        assert!(decryptor.decrypt(Codec::Opus, &cam(), &sealed).is_ok());
+        assert_eq!(
+            decryptor.decrypt(Codec::Opus, &cam(), &sealed),
+            Err(FrameError::Replay)
+        );
+    }
+
+    #[test]
+    fn replay_rejects_too_old() {
+        let (mut encryptor, mut decryptor) = pair(1);
+        let frames = sealed_frames(&mut encryptor, 1100);
+        assert!(
+            decryptor
+                .decrypt(Codec::Opus, &cam(), &frames[1099])
+                .is_ok()
+        );
+        assert_eq!(
+            decryptor.decrypt(Codec::Opus, &cam(), &frames[0]),
+            Err(FrameError::Replay)
+        );
+        assert!(
+            decryptor
+                .decrypt(Codec::Opus, &cam(), &frames[1099 - 1023])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn replay_allows_reordering_inside_the_window() {
+        let (mut encryptor, mut decryptor) = pair(1);
+        let mut frames = sealed_frames(&mut encryptor, 1024);
+        let mut rng = Rng::new(3);
+        for i in (1..frames.len()).rev() {
+            frames.swap(i, rng.below(i + 1));
+        }
+        for frame in &frames {
+            assert!(decryptor.decrypt(Codec::Opus, &cam(), frame).is_ok());
+        }
+    }
+
+    #[test]
+    fn replay_window_is_per_epoch() {
+        let keys = [0, 1].map(|epoch| crate::key::sender_key(&[epoch; 32], 1));
+        let mut decryptor = Decryptor::new(1024);
+        for (epoch, key) in keys.iter().enumerate() {
+            decryptor.set_key(Format::V1, epoch as u8, key);
+        }
+        for (epoch, key) in keys.iter().enumerate() {
+            let mut encryptor = Encryptor::new(0, 7);
+            encryptor.set_key(Format::V1, epoch as u8, key);
+            let sealed = encryptor.encrypt(Codec::Opus, &cam(), b"x").unwrap();
+            let (_, info) = decryptor
+                .decrypt_with_info(Codec::Opus, &cam(), &sealed)
+                .unwrap();
+            assert_eq!(info.map(|i| (i.epoch, i.counter)), Some((epoch as u8, 7)));
+        }
+    }
+
+    #[test]
+    fn forged_frames_do_not_move_the_window() {
+        let (mut encryptor, mut decryptor) = pair(1);
+        let frames = sealed_frames(&mut encryptor, 5000);
+        let mut forged = frames[4999].clone();
+        forged[0] ^= 1;
+        assert_eq!(
+            decryptor.decrypt(Codec::Opus, &cam(), &forged),
+            Err(FrameError::Auth)
+        );
+        assert!(decryptor.decrypt(Codec::Opus, &cam(), &frames[0]).is_ok());
+    }
+
+    fn mutation_seeds(rng: &mut Rng) -> Vec<(Codec, Vec<Vec<u8>>)> {
+        use codec::{
+            av1::tests::obu,
+            h26x::tests::{BitWriter, annex_b, h264_frame, zero_heavy},
+        };
+
+        let vp8_key = [0x10, 0x02, 0x00, 0x9D, 0x01, 0x2A, 0x80, 0x07, 0x38, 0x04];
+        let av1_key = [
+            obu(2, None, &[], Some(1)),
+            obu(1, None, &rng.bytes(12), Some(1)),
+            obu(5, Some(0x08), &rng.bytes(9), Some(1)),
+            obu(3, Some(0x08), &rng.bytes(20), Some(1)),
+            obu(4, Some(0x08), &rng.bytes(600), Some(2)),
+        ]
+        .concat();
+        let av1_delta = [
+            obu(2, None, &[], Some(1)),
+            obu(6, Some(0x08), &rng.bytes(200), Some(2)),
+        ]
+        .concat();
+        let h265_idr = BitWriter::new()
+            .bit(1)
+            .bit(0)
+            .ue(0)
+            .nal(&[0x26, 0x01], &zero_heavy(rng, 400));
+        let h265_trail = BitWriter::new()
+            .bit(0)
+            .ue(2)
+            .nal(&[0x02, 0x01], &zero_heavy(rng, 200));
+        let h265 = annex_b(
+            &[
+                &[0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF],
+                &[0x42, 0x01, 0x01, 0x01, 0x60, 0x90],
+                &[0x44, 0x01, 0xC1, 0x72],
+                &h265_idr,
+                &h265_trail,
+            ],
+            false,
+        );
+
+        vec![
+            (Codec::Opus, vec![rng.bytes(60), rng.bytes(160)]),
+            (
+                Codec::Vp8,
+                vec![
+                    [&vp8_key[..], &rng.bytes(400)].concat(),
+                    [&[0x31][..], &rng.bytes(200)].concat(),
+                ],
+            ),
+            (Codec::Vp9, vec![rng.bytes(300), rng.bytes(900)]),
+            (Codec::Av1, vec![av1_key, av1_delta]),
+            (Codec::H264, vec![h264_frame(rng).0, h264_frame(rng).0]),
+            (Codec::H265, vec![h265]),
+        ]
+    }
+
+    fn mutate(rng: &mut Rng, frame: &mut Vec<u8>) {
+        if frame.is_empty() {
+            frame.push(rng.next() as u8);
+            return;
+        }
+        let len = frame.len();
+        match rng.below(7) {
+            0 => frame[rng.below(len)] ^= 1 << rng.below(8),
+            1 => frame[rng.below(len)] = [0x00, 0x01, 0x03, 0x80, 0xFA][rng.below(5)],
+            2 => {
+                frame.remove(rng.below(len));
+            }
+            3 => frame.insert(rng.below(len + 1), rng.next() as u8),
+            4 => {
+                let start = rng.below(len);
+                let end = start + 1 + rng.below(len - start);
+                let slice = frame[start..end].to_vec();
+                let at = rng.below(len + 1);
+                frame.splice(at..at, slice);
+            }
+            5 => frame.truncate(rng.below(len)),
+            _ => {
+                let mut cuts = [
+                    rng.below(len + 1),
+                    rng.below(len + 1),
+                    rng.below(len + 1),
+                    rng.below(len + 1),
+                ];
+                cuts.sort_unstable();
+                let [a, b, c, d] = cuts;
+                *frame = [
+                    &frame[..a],
+                    &frame[c..d],
+                    &frame[b..c],
+                    &frame[a..b],
+                    &frame[d..],
+                ]
+                .concat();
+            }
+        }
+    }
+
+    #[test]
+    fn mutations_never_panic() {
+        let (mut encryptor, mut decryptor) = pair(1);
+        let mut rng = Rng::new(77);
+        for (codec, frames) in mutation_seeds(&mut rng) {
+            let sealed: Vec<Vec<u8>> = frames
+                .iter()
+                .map(|frame| encryptor.encrypt(codec, &cam(), frame).unwrap())
+                .collect();
+            for _ in 0..20_000 {
+                let mut frame = sealed[rng.below(sealed.len())].clone();
+                for _ in 0..1 + rng.below(3) {
+                    mutate(&mut rng, &mut frame);
+                }
+                let _ = decryptor.decrypt(codec, &cam(), &frame);
+                let _ = decryptor.decrypt_with_info(codec, &cam(), &frame);
+            }
+        }
+    }
+
     #[test]
     fn garbage_never_panics() {
-        let (_, decryptor) = pair(1);
+        let (_, mut decryptor) = pair(1);
         let mut rng = Rng::new(42);
         for codec in [
             Codec::Opus,

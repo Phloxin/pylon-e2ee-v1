@@ -35,6 +35,7 @@ pub struct Session {
     decryptors: HashMap<u64, Decryptor>,
     /// The epoch frames are sent under.
     sending: Option<u64>,
+    replay_window: u32,
 }
 
 /// The trailer carries the low 8 bits of the epoch (plan 3.4).
@@ -44,7 +45,7 @@ fn epoch_byte(epoch: u64) -> u8 {
 
 impl Session {
     /// `kid` and `counter` are this process's key slot and first counter value (plan 3.4).
-    pub fn new(client_id: u64, kid: u8, counter: u32) -> Self {
+    pub fn new(client_id: u64, kid: u8, counter: u32, replay_window: u32) -> Self {
         Self {
             member: Member::new(client_id),
             format: None,
@@ -52,6 +53,7 @@ impl Session {
             roots: Vec::new(),
             decryptors: HashMap::new(),
             sending: None,
+            replay_window,
         }
     }
 
@@ -221,8 +223,9 @@ impl Session {
     ) -> Result<Vec<u8>, FrameError> {
         let format = self.format.ok_or(FrameError::NoKey)?;
         let roots = &self.roots;
+        let window = self.replay_window;
         let decryptor = self.decryptors.entry(sender).or_insert_with(|| {
-            let mut decryptor = Decryptor::new();
+            let mut decryptor = Decryptor::new(window);
             for (epoch, root) in roots {
                 decryptor.set_key(format, epoch_byte(*epoch), &sender_key(root, sender));
             }

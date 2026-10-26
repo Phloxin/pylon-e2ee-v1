@@ -2,8 +2,8 @@
 //! bytes that get encrypted. Every split is recomputed by the receiver from the clear bytes
 //! alone, because Chromium does not hand the receiver the sender's exact bytes.
 
-mod av1;
-mod h26x;
+pub(super) mod av1;
+pub(super) mod h26x;
 
 use crate::frame::{Codec, FrameError, trailer::Trailer};
 
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn opus_and_vp9_encrypt_everything() {
         for codec in [Codec::Opus, Codec::Vp9] {
-            let (mut encryptor, decryptor) = pair(1);
+            let (mut encryptor, mut decryptor) = pair(1);
             let frame = vec![0xAB; 120];
             let sealed = encryptor.encrypt(codec, &cam(), &frame).unwrap();
             assert_ne!(sealed[0], 0xAB);
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn vp8_keeps_the_keyframe_header_readable() {
-        let (mut encryptor, decryptor) = pair(1);
+        let (mut encryptor, mut decryptor) = pair(1);
 
         let key = [
             &[0x10u8, 0x02, 0x00, 0x9D, 0x01, 0x2A, 0x80, 0x07, 0x38, 0x04][..],
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn vp8_clear_bytes_are_authenticated() {
-        let (mut encryptor, decryptor) = pair(1);
+        let (mut encryptor, mut decryptor) = pair(1);
         let mut sealed = encryptor.encrypt(Codec::Vp8, &cam(), &[0x10; 40]).unwrap();
         sealed[3] ^= 0x40;
         assert_eq!(
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn tiny_frames() {
-        let (mut encryptor, decryptor) = pair(1);
+        let (mut encryptor, mut decryptor) = pair(1);
         for codec in [Codec::Opus, Codec::Vp8, Codec::Vp9] {
             for frame in [&[][..], &[0x00][..], &[0x01, 0x02][..]] {
                 let sealed = encryptor.encrypt(codec, &cam(), frame).unwrap();

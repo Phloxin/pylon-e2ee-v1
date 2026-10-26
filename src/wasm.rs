@@ -132,8 +132,8 @@ pub struct Receiver(Decryptor);
 #[wasm_bindgen]
 impl Receiver {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Receiver {
-        Receiver(Decryptor::new())
+    pub fn new(window: u32) -> Receiver {
+        Receiver(Decryptor::new(window))
     }
 
     #[wasm_bindgen(js_name = setKey)]
@@ -148,7 +148,7 @@ impl Receiver {
     }
 
     pub fn decrypt(
-        &self,
+        &mut self,
         codec_id: u8,
         source: &FrameSource,
         frame: &[u8],
@@ -156,12 +156,6 @@ impl Receiver {
         self.0
             .decrypt(codec(codec_id)?, &source.0, frame)
             .map_err(frame_error)
-    }
-}
-
-impl Default for Receiver {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -193,8 +187,18 @@ pub struct E2eeSession(Session);
 #[wasm_bindgen]
 impl E2eeSession {
     #[wasm_bindgen(constructor)]
-    pub fn new(self_id: &str, kid: u8, counter: u32) -> Result<E2eeSession, JsError> {
-        Ok(E2eeSession(Session::new(client_id(self_id)?, kid, counter)))
+    pub fn new(
+        self_id: &str,
+        kid: u8,
+        counter: u32,
+        replay_window: u32,
+    ) -> Result<E2eeSession, JsError> {
+        Ok(E2eeSession(Session::new(
+            client_id(self_id)?,
+            kid,
+            counter,
+            replay_window,
+        )))
     }
 
     #[wasm_bindgen(js_name = setParams)]

@@ -44,7 +44,7 @@ impl Call {
     }
 
     fn session(&self, client_id: u64) -> Session {
-        let mut session = Session::new(client_id, 0, 0);
+        let mut session = Session::new(client_id, 0, 0, 1024);
         session
             .set_params(u16::from(CIPHERSUITE), self.sender.encoded(), FORMAT)
             .unwrap();
@@ -634,7 +634,7 @@ fn joiners_check_the_external_sender() {
 
     // This joiner was told a different node's sender.
     let other_node = ExternalSenderKey::generate().unwrap();
-    let mut joiner = Session::new(101, 0, 0);
+    let mut joiner = Session::new(101, 0, 0, 1024);
     joiner
         .set_params(u16::from(CIPHERSUITE), other_node.encoded(), FORMAT)
         .unwrap();
@@ -664,7 +664,7 @@ fn joiners_check_the_external_sender() {
 #[test]
 fn params_gate_unsupported_formats() {
     let call = Call::new();
-    let mut session = Session::new(1, 0, 0);
+    let mut session = Session::new(1, 0, 0, 1024);
     assert_eq!(
         session.set_params(u16::from(CIPHERSUITE), call.sender.encoded(), 9),
         Err(MlsError::Rejected)
