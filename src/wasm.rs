@@ -323,4 +323,43 @@ impl E2eeSession {
     pub fn call_code(&self) -> Option<String> {
         self.0.call_code()
     }
+
+    /// The key a native encoder sends this client's frames under, or `undefined` when not
+    /// sending. See `Session::sending_key`.
+    #[wasm_bindgen(js_name = sendingKey)]
+    pub fn sending_key(&self) -> Option<SendingKey> {
+        self.0
+            .sending_key()
+            .map(|(format, epoch, key)| SendingKey {
+                format: format as u8,
+                epoch,
+                key: key.to_vec(),
+            })
+    }
+}
+
+/// What `E2eeSession.sendingKey` returns: the format id, the epoch byte and the 16 byte key.
+#[wasm_bindgen]
+pub struct SendingKey {
+    format: u8,
+    epoch: u8,
+    key: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl SendingKey {
+    #[wasm_bindgen(getter)]
+    pub fn format(&self) -> u8 {
+        self.format
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn epoch(&self) -> u8 {
+        self.epoch
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn key(&self) -> Vec<u8> {
+        self.key.clone()
+    }
 }

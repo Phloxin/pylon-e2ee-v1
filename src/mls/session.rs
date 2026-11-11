@@ -10,7 +10,7 @@
 use {
     crate::{
         Codec, Decryptor, Encryptor, Format, FrameError, Source,
-        key::{ROOT_LEN, sender_key},
+        key::{KEY_LEN, ROOT_LEN, sender_key},
         mls::{
             CIPHERSUITE, MlsError,
             client::{Applied, Member},
@@ -250,6 +250,15 @@ impl Session {
 
     pub fn sending_epoch(&self) -> Option<u64> {
         self.sending
+    }
+
+    /// The format, epoch byte and this client's own sender key of the epoch it sends under, for
+    /// a native encoder that seals frames with its own kid. `None` when it isn't sending.
+    pub fn sending_key(&self) -> Option<(Format, u8, [u8; KEY_LEN])> {
+        let epoch = self.sending?;
+        let format = self.format?;
+        let root = self.root(epoch)?;
+        Some((format, epoch_byte(epoch), sender_key(&root, self.client_id())))
     }
 
     /// The client ids in the MLS group: the participant list (plan 5.7).

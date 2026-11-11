@@ -700,3 +700,28 @@ fn a_bigger_channel() {
         }
     }
 }
+
+#[test]
+fn a_native_encoder_seals_with_the_exported_key() {
+    let mut call = Call::new();
+    call.found(100);
+    call.join(0, 101);
+    let (format, epoch, key) = call.members[0].sending_key().unwrap();
+    assert_eq!(format, crate::Format::V1);
+    assert_eq!(Some(u64::from(epoch)), call.members[0].sending_epoch());
+
+    let source = Source::stream("native-stream").unwrap();
+    let mut encoder = crate::Encryptor::new(1, 12_345);
+    encoder.set_key(format, epoch, &key);
+    let frame = [9, 8, 7, 6, 5, 4];
+    let sealed = encoder.encrypt(Codec::Opus, &source, &frame).unwrap();
+    assert_eq!(
+        call.members[1].decrypt(100, Codec::Opus, &source, &sealed),
+        Ok(frame.to_vec())
+    );
+
+    let mut idle = call.session(102);
+    assert!(idle.sending_key().is_none());
+    idle.leave();
+    assert!(idle.sending_key().is_none());
+}
